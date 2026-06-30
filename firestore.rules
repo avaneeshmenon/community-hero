@@ -1,0 +1,191 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Default Deny Case
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ==========================================
+    // HELPER FUNCTIONS (Phase 3 primitives)
+    // ==========================================
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128;
+    }
+
+    // ==========================================
+    // USERS COLLECTION RULES
+    // ==========================================
+    match /users/{userId} {
+      // Allow any signed-in user to retrieve user documents / list leaderboard
+      allow get, list: if isSignedIn();
+      
+      // Users can only create their own profile document
+      allow create: if isSignedIn() && userId == request.auth.uid
+        && incoming().uid == request.auth.uid
+        && incoming().impactPoints == 0;
+        
+      // Tiered updates: users can update their profile or increment other users' impactPoints, earnedBadges, or previousTier
+      allow update: if isSignedIn() && (
+        (userId == request.auth.uid) ||
+        (incoming().diff(existing()).affectedKeys().hasOnly(['impactPoints', 'earnedBadges', 'previousTier']))
+      );
+      
+      // Allow users to delete their own profile document
+      allow delete: if isSignedIn() && userId == request.auth.uid;
+    }
+
+    // ==========================================
+    // REPORTS & NESTED SUB-COLLECTIONS RULES
+    // ==========================================
+    match /reports/{reportId} {
+      
+      // Strict list & single-document queries security
+      allow get, list: if isSignedIn();
+
+      // Help validate reports creation
+      function isValidReport(data) {
+        return data.createdBy is string 
+            && data.createdBy.size() <= 128
+            && data.createdByName is string
+            && data.title is string
+            && data.title.size() > 0
+            && data.description is string
+            && (!('department' in data) || data.department in ["Roads", "Water", "Electricity", "Waste", "Safety", "Animals", "Environment", "Public Facilities"])
+            && (!('subcategory' in data) || data.subcategory is string)
+            && data.severity in ["Low", "Medium", "High"]
+            && data.status in ["Reported", "Verified", "In Progress", "Resolved", "Under Review"]
+            && data.locationText is string
+            && (data.verificationCount is int || data.verificationCount is float)
+            && (!('commentCount' in data) || data.commentCount is int || data.commentCount is float)
+            && (!('flagCount' in data) || data.flagCount is int || data.flagCount is float)
+            && (!('underReview' in data) || data.underReview is bool);
+      }
+
+      // Creating a report
+      allow create: if isSignedIn() 
+        && isValidId(reportId)
+        && isValidReport(incoming())
+        && incoming().createdBy == request.auth.uid
+        && incoming().status == 'Reported'
+        && incoming().verificationCount == 0
+        && incoming().commentCount == 0
+        && incoming().createdAt == request.time;
+
+    // Updating a report
+    allow update: if isSignedIn() && (
+      // Action 1: Owner changes status or details of their own report (as long as it wasn't already Resolved)
+      (existing().createdBy == request.auth.uid && existing().status != 'Resolved') ||
+      
+      // Action 2: Any signed-in user updates community/system-managed fields (verifications, flags, comments, complaints, escalations, resolutions)
+      (incoming().diff(existing()).affectedKeys().hasOnly([
+        'verificationCount', 'status', 'flagCount', 'underReview', 'verifiedAt',
+        'commentCount', 'afterImageSubmitted', 'aiVerification', 'complaint',
+        'escalationLevel', 'escalatedAt', 'escalationHistory', 'authorityActions'
+      ]))
+    );
+
+      // Deleting a report
+      allow delete: if isSignedIn() && existing().createdBy == request.auth.uid;
+
+      // Flags Subcollection: prevent double-flagging
+      match /flags/{userId} {
+        allow get, list: if isSignedIn();
+        allow create: if isSignedIn() 
+          && userId == request.auth.uid
+          && incoming().flaggedBy == request.auth.uid
+          && (incoming().flaggedAt == request.time || incoming().flaggedAt is timestamp);
+        allow delete: if isSignedIn();
+      }
+
+      // Verifications Subcollection: prevent double-voting
+      match /verifications/{userId} {
+        allow get, list: if isSignedIn();
+        allow create: if isSignedIn() 
+          && userId == request.auth.uid
+          && incoming().verifiedBy == request.auth.uid
+          && (incoming().verifiedAt == request.time || incoming().verifiedAt is timestamp);
+        allow delete: if isSignedIn() && (
+          userId == request.auth.uid ||
+          get(/databases/$(database)/documents/reports/$(reportId)).data.createdBy == request.auth.uid
+        );
+      }
+
+      // Comments Subcollection
+      match /comments/{commentId} {
+        allow get, list: if isSignedIn();
+        allow create: if isSignedIn() 
+          && (incoming().authorId == request.auth.uid || incoming().authorUid == request.auth.uid)
+          && (incoming().createdAt == request.time || incoming().createdAt is timestamp);
+        // Allows any user to append a reply Obj to nested replies array
+        allow update: if isSignedIn()
+          && (incoming().diff(existing()).affectedKeys().hasOnly(['replies']));
+        allow delete: if isSignedIn();
+      }
+
+      // Images subcollection inside reports (for multiple images support)
+      match /images/{imageId} {
+        allow get, list: if isSignedIn();
+        allow create, update: if isSignedIn() 
+          && isValidId(imageId)
+          && incoming().data is string
+          && (incoming().order is int || incoming().order is float);
+        allow delete: if isSignedIn() && (
+          get(/databases/$(database)/documents/reports/$(reportId)).data.createdBy == request.auth.uid
+        );
+      }
+
+      // AfterImages subcollection inside reports (for multiple after photos support)
+      match /afterImages/{imageId} {
+        allow get, list: if isSignedIn();
+        allow create, update: if isSignedIn() 
+          && isValidId(imageId)
+          && incoming().data is string
+          && (incoming().order is int || incoming().order is float);
+        allow delete: if isSignedIn() && (
+          get(/databases/$(database)/documents/reports/$(reportId)).data.createdBy == request.auth.uid
+        );
+      }
+    }
+
+    // ==========================================
+    // REPORT IMAGES RULES (separate collection for lazy load)
+    // ==========================================
+    match /reportImages/{reportId} {
+      allow get: if isSignedIn();
+      allow create, update: if isSignedIn() 
+        && isValidId(reportId);
+      allow delete: if isSignedIn();
+    }
+
+    // ==========================================
+    // NOTIFICATIONS & ITEMS RULES
+    // ==========================================
+    match /notifications/{userId} {
+      allow get, list: if isSignedIn() && userId == request.auth.uid;
+      
+      match /items/{itemId} {
+        allow get, list: if isSignedIn() && userId == request.auth.uid;
+        allow create: if isSignedIn();
+        allow update, delete: if isSignedIn() && userId == request.auth.uid;
+      }
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "Community Hero",
+  "description": "A civic issue-reporting and tracking platform for citizens to report and track local issues like potholes, water leakages, faulty streetlights, and waste.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
